@@ -1,0 +1,27 @@
+{
+  "name": "whatsapp-agent",
+  "version": "1.0.0",
+  "description": "General-purpose AI agent on WhatsApp with Circle USDC wallet",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^3.0.83",
+    "@types/express": "^5.0.6",
+    "ai": "^6.0.208",
+    "axios": "^1.7.2",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "spectrum-ts": "^5.2.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.15.1",
+    "typescript": "^5.4.5"
+  }
+}

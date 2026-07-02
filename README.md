@@ -1,35 +1,43 @@
 # Friday — WhatsApp AI Agent + Circle Wallet
 
-A general-purpose AI agent that lives natively on WhatsApp. Powered by Google Gemini, with shell execution capabilities and a Circle USDC wallet to pay for marketplace services when it can't handle something itself.
+A general-purpose AI agent that lives natively on WhatsApp. It runs on Groq (Llama 3.3 70B), can execute shell commands, remembers your conversation across restarts, and holds a Circle USDC wallet so it can pay for x402 marketplace services when it cannot do something itself.
 
 ## Architecture
 
 ```
-You (WhatsApp) → Photon Spectrum → Gemini Brain → Tools
-                                       │
-                              ┌────────┼────────┐
-                              │        │        │
-                          Free Tools  Shell   Circle CLI
-                          (search,    (run     (wallet,
-                           weather,   commands  pay for
-                           calc)      on host)  services)
+You (WhatsApp) → Twilio → ngrok → Express webhook → Groq brain → Tools
+                                                        │
+                          ┌─────────────────────────────┼─────────────────────────────┐
+                          │                             │                             │
+                     Free tools                    Shell / URL                   Circle CLI
+                (weather, calc,                (run commands,               (wallet + Gateway,
+                 date/time)                     fetch pages)                 pay x402 services)
+                                                                                   │
+                                                                    Paid via marketplace (x402):
+                                                                    web search, X account analysis
 ```
 
 ## What it can do
 
 ### Free (built-in)
-- 🔍 Web search (Brave Search API)
-- 🧮 Maths & calculations
-- 🌤️ Weather for any city (Open-Meteo — no key needed)
-- 🕐 Date & time in any timezone
-- 💻 Shell command execution (with safety controls)
-- 🌐 URL content fetching
+- Maths and calculations
+- Weather for any city (Open-Meteo, no key needed)
+- Date and time in any timezone
+- Shell command execution (with safety controls)
+- URL content fetching
 
-### Paid (via Circle USDC wallet)
-Once you set up the Circle agent wallet (one-time), the agent can:
-- 🛒 Browse the Circle Agent Marketplace for services
-- 💳 Pay for x402-enabled services with USDC (always asks first)
-- 📞 Make AI phone calls, research people, search domains, and more
+### Paid per use (via the Circle x402 marketplace)
+Friday pays a fraction of a cent from your wallet, automatically for small amounts:
+- Web search for current facts and news (Tavily via the marketplace)
+- X / Twitter account analysis (real profile stats and recent tweets)
+- Any other x402 service it discovers: it inspects the seller, tells you the cost, and asks before paying anything above the auto cap
+
+### Two balances, spent correctly
+The Circle agent wallet holds two separate USDC pools:
+- On-chain balance, held per blockchain (vanilla x402)
+- Gateway balance, a cross-chain nanopayments pool
+
+When Friday pays, it inspects each seller's accepted chains and schemes, checks both pools, and pays on a chain that actually works, preferring Gateway when the seller supports it.
 
 ## Setup
 
@@ -50,72 +58,78 @@ Fill in your `.env`:
 
 | Key | Where to get it |
 |---|---|
-| `PHOTON_PROJECT_ID` + `PHOTON_PROJECT_SECRET` | [app.photon.codes](https://app.photon.codes) → your project |
-| `GOOGLE_GENERATIVE_AI_API_KEY` | [aistudio.google.com/apikey](https://aistudio.google.com/apikey) — free |
-| `BRAVE_SEARCH_API_KEY` | [api.search.brave.com](https://api.search.brave.com) — optional, $3/mo |
+| `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` | [console.twilio.com](https://console.twilio.com) → Account Info |
+| `TWILIO_WHATSAPP_NUMBER` | The Twilio sandbox number, `whatsapp:+14155238886` |
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com), free |
 
-### 3. Connect your WhatsApp Business number to Photon
+Web search needs no key. It runs through the Circle marketplace and is paid per call from your wallet (see `SEARCH_SERVICE_URL` and `SEARCH_MAX_AUTO_USDC`).
 
-1. Log in to [app.photon.codes](https://app.photon.codes)
-2. Go to your project → Providers → WhatsApp Business
-3. Connect your WhatsApp Business number
-4. Copy `Project ID` and `Project Secret` into `.env`
-
-### 4. Install Circle CLI (optional — can be done later via WhatsApp)
+### 3. Install the Circle CLI
 
 ```bash
 npm install -g @circle-fin/cli@latest
 ```
 
-### 5. Run the agent
+### 4. Run the agent
 
 ```bash
 npm run dev
 ```
 
-### 6. Set up the Circle wallet (from WhatsApp!)
+This starts the webhook server on port 8080. Expose it with ngrok:
 
-Once the agent is live, send this message in WhatsApp:
+```bash
+ngrok http 8080
+```
+
+### 5. Point Twilio at your webhook
+
+In the Twilio console, go to Messaging, Try it out, Send a WhatsApp message, Sandbox settings. Put your ngrok URL plus `/webhook` in the "When a message comes in" field (HTTP POST) and save:
+
+```
+https://<your-ngrok-subdomain>.ngrok-free.dev/webhook
+```
+
+Then send the sandbox `join <keyword>` message from your WhatsApp to `+1 415 523 8886` to opt in.
+
+### 6. Set up the Circle wallet (from WhatsApp)
+
+Once the agent is live, message it:
 
 ```
 Set up my Circle agent wallet
 ```
 
-Or paste:
-```
-curl -sL https://agents.circle.com/skills/setup.md
-```
-
-The agent will read the Circle setup instructions and walk you through it step by step — accepting terms, logging in, creating the wallet, all from WhatsApp.
+Friday reads the Circle setup instructions and walks you through accepting terms, logging in, and creating the wallet, all from WhatsApp.
 
 ## WhatsApp Commands
 
 | Command | What it does |
 |---|---|
 | `/help` | Show all capabilities |
-| `/balance` | Check USDC wallet balance |
+| `/balance` | On-chain wallet balance |
+| `/gateway` | Gateway (nanopayments) balance |
+| `/total` | Combined total balance, summed exactly in code |
 | `/wallet` | Get wallet address |
 | `/setup` | Start Circle wallet setup |
 | `/services` | Browse marketplace services |
 | `/reset` | Clear conversation history |
 
+## Memory
+
+Conversation history is persisted to `.data/conversations.json`, so Friday remembers context across restarts. The `.data/` directory is gitignored because it contains your messages.
+
 ## Shell Execution Safety
 
 The agent can run shell commands, but with guardrails:
 
-- **Auto-approved**: `circle` CLI commands, Circle skill fetches
-- **Requires approval**: Any other command — the agent asks you first
-- **Hard-blocked**: Destructive commands (`rm -rf /`, `mkfs`, etc.)
+- Auto-approved: `circle` CLI commands and Circle skill fetches
+- Requires approval: any other command, the agent asks you first
+- Hard-blocked: destructive commands (`rm -rf /`, `mkfs`, and similar)
 
-You control what's auto-approved via `ALLOWED_COMMAND_PREFIXES` in `.env`.
+You control what is auto-approved via `ALLOWED_COMMAND_PREFIXES` in `.env`.
 
-## Deploy
+## Notes
 
-```bash
-# Railway (recommended)
-npm install -g @railway/cli
-railway login && railway init && railway up
-```
-
-Set your environment variables in the Railway dashboard.
-Don't forget to install `@circle-fin/cli` on the deployment server too.
+- The Twilio WhatsApp sandbox caps you at 50 messages per day. Moving to production needs a WhatsApp Business API sender.
+- `llama-3.3-70b-versatile` is the most reliable Groq model for tool calling. The agent retries and falls back to a plain text answer if Groq emits a malformed tool call.

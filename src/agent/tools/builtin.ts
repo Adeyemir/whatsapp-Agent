@@ -1,54 +1,8 @@
 import { tool } from "ai";
 import { z } from "zod";
 import axios from "axios";
-import { config } from "../../config.js";
 
-// ─── Web Search ───────────────────────────────────────────────────────────────
-
-export const webSearch = tool({
-  description:
-    "Search the web for current information, news, facts, or any topic. Use this when you need up-to-date information you don't already know.",
-  inputSchema: z.object({
-    query: z.string().describe("The search query"),
-    count: z
-      .number()
-      .optional()
-      .default(5)
-      .describe("Number of results to return (1-10)"),
-  }),
-  execute: async ({ query, count }) => {
-    if (!config.BRAVE_SEARCH_API_KEY) {
-      return {
-        error:
-          "Web search is not configured. Please add BRAVE_SEARCH_API_KEY to your .env file.",
-      };
-    }
-    try {
-      const response = await axios.get(
-        "https://api.search.brave.com/res/v1/web/search",
-        {
-          headers: {
-            Accept: "application/json",
-            "Accept-Encoding": "gzip",
-            "X-Subscription-Token": config.BRAVE_SEARCH_API_KEY,
-          },
-          params: { q: query, count: Math.min(count ?? 5, 10) },
-        }
-      );
-      const results = response.data?.web?.results ?? [];
-      return {
-        query,
-        results: results.map((r: { title: string; url: string; description: string }) => ({
-          title: r.title,
-          url: r.url,
-          description: r.description,
-        })),
-      };
-    } catch (err) {
-      return { error: `Search failed: ${(err as Error).message}` };
-    }
-  },
-});
+// Web search now lives in tools/circle.ts (paid via the x402 marketplace).
 
 // ─── Calculator ───────────────────────────────────────────────────────────────
 

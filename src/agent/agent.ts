@@ -1,14 +1,20 @@
-import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { createOpenAI } from "@ai-sdk/openai";
 import { generateText, stepCountIs } from "ai";
 import { config } from "../config.js";
 import { getHistory, addMessage, clearHistory } from "../memory/store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
-import { webSearch, calculator, getDateTime, getWeather } from "./tools/builtin.js";
+import { calculator, getDateTime, getWeather } from "./tools/builtin.js";
 import {
+  webSearch,
+  analyzeXAccount,
   checkWalletBalance,
+  checkGatewayBalance,
+  getTotalBalance,
+  computeTotalBalance,
   getWalletStatus,
   payForService,
   discoverServices,
+  getWalletAddress,
 } from "./tools/circle.js";
 import {
   executeCommand,
@@ -18,10 +24,13 @@ import {
   executeApprovedCommand,
 } from "./tools/shell.js";
 
-// Initialise Gemini provider
-const google = createGoogleGenerativeAI({
-  apiKey: config.GOOGLE_GENERATIVE_AI_API_KEY,
+// Initialise Groq via OpenAI-compatible provider
+const groq = createOpenAI({
+  apiKey: config.GROQ_API_KEY,
+  baseURL: "https://api.groq.com/openai/v1",
 });
+// Note: always call groq.chat(model) — it targets /chat/completions.
+// The default groq(model) would hit /responses, which Groq doesn't support.
 
 // Approval detection
 const APPROVAL_PHRASES = [
@@ -71,7 +80,9 @@ export async function runAgent(
       `• Pay for marketplace services\n` +
       `• Discover services to outsource tasks\n\n` +
       `COMMANDS\n` +
-      `/balance — check wallet\n` +
+      `/balance — on-chain wallet balance\n` +
+      `/gateway — Gateway (nanopayments) balance\n` +
+      `/total   — combined total balance\n` +
       `/wallet  — get wallet address\n` +
       `/setup   — set up Circle wallet\n` +
       `/services — browse marketplace\n` +
@@ -81,15 +92,50 @@ export async function runAgent(
   }
 
   if (text === "/balance") {
-    // Direct shortcut — run circle wallet balance
+    // Direct shortcut — resolve the agent wallet address first, then query balance
     try {
+      const address = await getWalletAddress("BASE");
+      if (!address) {
+        return "No agent wallet found on BASE. Say 'create my wallet' to set one up.";
+      }
       const result = await executeApprovedCommand(
-        "circle wallet balance --chain BASE --output json"
+        `circle wallet balance --chain BASE --address ${address} --output json`
       );
       return result;
     } catch (err) {
       return `❌ Could not check balance: ${(err as Error).message}`;
     }
+  }
+
+  if (text === "/gateway") {
+    // Cross-chain Gateway (nanopayments) balance — the pool that pays for services
+    try {
+      const address = await getWalletAddress("BASE");
+      if (!address) {
+        return "No agent wallet found. Say 'create my wallet' to set one up.";
+      }
+      const result = await executeApprovedCommand(
+        `circle gateway balance --address ${address} --chain BASE --all --output json`
+      );
+      return result;
+    } catch (err) {
+      return `❌ Could not check Gateway balance: ${(err as Error).message}`;
+    }
+  }
+
+  if (text === "/total") {
+    // Exact total USDC (Gateway + on-chain), summed in code — never the model's math
+    const t = await computeTotalBalance();
+    if ("error" in t) return `❌ ${t.error}`;
+    let msg = `💰 Total balance: ${t.totalUsdc} USDC\n\n`;
+    msg += `• Gateway (nanopayments): ${t.gatewayUsdc} USDC\n`;
+    msg += `• On-chain: ${t.onchainUsdc} USDC`;
+    if (Array.isArray(t.onchainByChain)) {
+      for (const c of t.onchainByChain) {
+        msg += `\n   - ${c.chain}: ${c.usdc} USDC`;
+      }
+    }
+    return msg;
   }
 
   if (text === "/wallet") {
@@ -145,57 +191,90 @@ export async function runAgent(
 /**
  * Run the LLM with full tool access.
  */
+// Groq's Llama models sometimes emit a malformed tool call (raw
+// "<function=name(...)>" text) that Groq rejects with `tool_use_failed`.
+// It is non-deterministic, so a re-roll usually succeeds.
+function isToolFormatError(err: any): boolean {
+  const body = String(err?.responseBody ?? "");
+  const msg = String(err?.message ?? "");
+  return (
+    body.includes("tool_use_failed") ||
+    msg.includes("Failed to call a function") ||
+    msg.includes("tool call validation failed")
+  );
+}
+
 async function runLLM(conversationId: string): Promise<string> {
   const history = getHistory(conversationId);
   const systemPrompt = buildSystemPrompt();
 
-  try {
-    const result = await generateText({
-      model: google(config.GEMINI_MODEL),
-      system: systemPrompt,
-      messages: history.map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      })),
-      tools: {
-        // Free built-in tools
-        webSearch,
-        calculator,
-        getDateTime,
-        getWeather,
+  const allTools = {
+    // Free built-in tools
+    webSearch,
+    analyzeXAccount,
+    calculator,
+    getDateTime,
+    getWeather,
 
-        // Shell & URL tools
-        executeCommand,
-        fetchUrl,
+    // Shell & URL tools
+    executeCommand,
+    fetchUrl,
 
-        // Circle wallet tools (via CLI)
-        checkWalletBalance,
-        getWalletStatus,
-        payForService,
-        discoverServices,
-      },
-      stopWhen: stepCountIs(10),
-      onStepFinish: ({ toolResults }) => {
-        if (toolResults && toolResults.length > 0) {
-          console.log(
-            `🔧 [${conversationId}] Tool step:`,
-            JSON.stringify(
-              toolResults.map((r: { toolName?: string }) => r.toolName ?? "unknown"),
-            )
-          );
-        }
-      },
-    });
+    // Circle wallet tools (via CLI)
+    checkWalletBalance,
+    checkGatewayBalance,
+    getTotalBalance,
+    getWalletStatus,
+    payForService,
+    discoverServices,
+  };
 
-    const reply = result.text;
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // Last attempt: drop tools so a model stuck emitting a malformed tool call
+    // is forced to answer in plain text instead of failing again.
+    const useTools = attempt < MAX_ATTEMPTS;
+    try {
+      const result = await generateText({
+        model: groq.chat(config.GROQ_MODEL),
+        temperature: 0.4,
+        system: systemPrompt,
+        messages: history.map((m) => ({
+          role: m.role as "user" | "assistant",
+          content: m.content,
+        })),
+        ...(useTools ? { tools: allTools, stopWhen: stepCountIs(10) } : {}),
+        onStepFinish: ({ toolResults }) => {
+          if (toolResults && toolResults.length > 0) {
+            console.log(
+              `🔧 [${conversationId}] Tool step:`,
+              JSON.stringify(
+                toolResults.map((r: { toolName?: string }) => r.toolName ?? "unknown"),
+              )
+            );
+          }
+        },
+      });
 
-    if (reply) {
-      addMessage(conversationId, { role: "assistant", content: reply });
+      const reply = result.text;
+      if (reply) {
+        addMessage(conversationId, { role: "assistant", content: reply });
+      }
+      return reply || "I processed your request but didn't generate a text response. Try asking differently.";
+    } catch (err: any) {
+      if (isToolFormatError(err) && attempt < MAX_ATTEMPTS) {
+        console.warn(
+          `⚠️  [${conversationId}] Groq malformed tool call, retrying (${attempt}/${MAX_ATTEMPTS})`
+        );
+        continue;
+      }
+      console.error(`❌ Agent error for ${conversationId}:`);
+      console.error(`   message:  ${err?.message}`);
+      console.error(`   status:   ${err?.statusCode}`);
+      console.error(`   body:     ${err?.responseBody}`);
+      console.error(`   cause:    ${err?.cause}`);
+      return "Something went wrong on my end. Please try again in a moment.";
     }
-
-    return reply || "I processed your request but didn't generate a text response. Try asking differently.";
-  } catch (err) {
-    console.error(`❌ Agent error for ${conversationId}:`, err);
-    return "Something went wrong on my end. Please try again in a moment.";
   }
+  return "Something went wrong on my end. Please try again in a moment.";
 }

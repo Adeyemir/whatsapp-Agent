@@ -11,12 +11,13 @@
   },
   "dependencies": {
     "@ai-sdk/google": "^3.0.83",
+    "@ai-sdk/openai": "^3.0.80",
     "@types/express": "^5.0.6",
     "ai": "^6.0.208",
     "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
-    "spectrum-ts": "^5.2.0",
+    "twilio": "^6.0.2",
     "zod": "^3.23.8"
   },
   "devDependencies": {

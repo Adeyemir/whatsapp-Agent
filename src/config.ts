@@ -1,21 +1,28 @@
 import { z } from "zod";
 import dotenv from "dotenv";
 
-dotenv.config();
+dotenv.config({ override: true });
 
 const envSchema = z.object({
-  // Telegram Bot (from @BotFather)
-  TELEGRAM_BOT_TOKEN: z.string().min(1, "Missing TELEGRAM_BOT_TOKEN"),
-  WEBHOOK_SECRET: z.string().default("friday-webhook-secret-2024"),
+  // Twilio WhatsApp
+  TWILIO_ACCOUNT_SID: z.string().min(1, "Missing TWILIO_ACCOUNT_SID"),
+  TWILIO_AUTH_TOKEN: z.string().min(1, "Missing TWILIO_AUTH_TOKEN"),
+  TWILIO_WHATSAPP_NUMBER: z.string().default("whatsapp:+14155238886"),
 
-  // Google Gemini
-  GOOGLE_GENERATIVE_AI_API_KEY: z
-    .string()
-    .min(1, "Missing GOOGLE_GENERATIVE_AI_API_KEY"),
-  GEMINI_MODEL: z.string().default("gemini-2.0-flash"),
+  // Groq
+  GROQ_API_KEY: z.string().min(1, "Missing GROQ_API_KEY"),
+  GROQ_MODEL: z.string().default("llama-3.3-70b-versatile"),
 
-  // Web Search (optional)
+  // Web Search (optional Brave key; marketplace search is the default path)
   BRAVE_SEARCH_API_KEY: z.string().optional(),
+
+  // Marketplace web search (x402). Friday pays per search from the wallet/Gateway.
+  SEARCH_SERVICE_URL: z
+    .string()
+    .default("https://api.aisa.one/apis/v2/tavily/search"),
+  // Searches at or under this USDC cost auto-pay (user opted into pay-per-search).
+  // Anything pricier asks for confirmation first.
+  SEARCH_MAX_AUTO_USDC: z.coerce.number().default(0.05),
 
   // Agent Behaviour
   AGENT_NAME: z.string().default("Friday"),

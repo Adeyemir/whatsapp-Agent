@@ -11,7 +11,7 @@ const envSchema = z.object({
 
   // Groq
   GROQ_API_KEY: z.string().min(1, "Missing GROQ_API_KEY"),
-  GROQ_MODEL: z.string().default("llama-3.3-70b-versatile"),
+  GROQ_MODEL: z.string().default("openai/gpt-oss-120b"),
 
   // Web Search (optional Brave key; marketplace search is the default path)
   BRAVE_SEARCH_API_KEY: z.string().optional(),

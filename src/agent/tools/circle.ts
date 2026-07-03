@@ -1,6 +1,7 @@
 import { tool } from "ai";
 import { z } from "zod";
 import { exec } from "child_process";
+import axios from "axios";
 import { config } from "../../config.js";
 
 /**
@@ -532,9 +533,40 @@ function extractSearchResults(
   return found ?? [];
 }
 
+/**
+ * Free web search via the Brave Search API. Returns results, or null if no key
+ * is set or the request fails (so the caller can fall back to the marketplace).
+ */
+async function braveSearch(
+  query: string
+): Promise<Array<{ title?: string; url?: string; content?: string }> | null> {
+  const key = config.BRAVE_SEARCH_API_KEY;
+  if (!key) return null;
+  try {
+    const res = await axios.get("https://api.search.brave.com/res/v1/web/search", {
+      headers: { Accept: "application/json", "X-Subscription-Token": key },
+      params: { q: query, count: 5 },
+      timeout: 15_000,
+    });
+    const results = (res.data?.web?.results ?? []) as Array<{
+      title?: string;
+      url?: string;
+      description?: string;
+    }>;
+    if (results.length === 0) return null;
+    return results.map((r) => ({
+      title: r.title,
+      url: r.url,
+      content: (r.description ?? "").slice(0, 300),
+    }));
+  } catch {
+    return null;
+  }
+}
+
 export const webSearch = tool({
   description:
-    "Search the web for current information, news, facts, prices, or anything you may not know or that could have changed. This uses a paid marketplace service (a small USDC fee per search, already pre-authorized up to a cap). Prefer this over answering from memory for anything current or factual.",
+    "Search the web for current information, news, facts, prices, or anything you may not know or that could have changed. Free when a Brave key is set, otherwise a small pre-authorized USDC fee via the marketplace. Prefer this over answering from memory for anything current or factual.",
   inputSchema: z.object({
     query: z.string().describe("The search query"),
     topic: z
@@ -548,6 +580,12 @@ export const webSearch = tool({
       .describe("Only needed if a search costs more than the auto-pay cap. Set true after the user approves the higher cost."),
   }),
   execute: async ({ query, topic, confirmed }) => {
+    // Try free Brave search first; fall back to the paid marketplace on miss.
+    const brave = await braveSearch(query);
+    if (brave && brave.length > 0) {
+      return { query, source: "brave", costUsdc: "0", results: brave.slice(0, 5) };
+    }
+
     const url = config.SEARCH_SERVICE_URL;
     const body = JSON.stringify({ query, topic: topic ?? "general" });
 
@@ -680,6 +718,83 @@ export const analyzeXAccount = tool({
       tweetsNote,
       note: "Real data from X via the paid marketplace. Analyze these actual numbers and tweets. Do not add generic advice unless asked.",
     };
+  },
+});
+
+// ─── Crypto price (accurate, via CoinGecko marketplace) ───────────────────────
+
+const CRYPTO_PRICE_URL = "https://api.aisa.one/apis/v2/coingecko/simple/price";
+
+// Common tickers/names to CoinGecko IDs. Unknown inputs pass through lowercased.
+const TICKER_TO_ID: Record<string, string> = {
+  btc: "bitcoin",
+  eth: "ethereum",
+  ether: "ethereum",
+  sol: "solana",
+  usdc: "usd-coin",
+  usdt: "tether",
+  tether: "tether",
+  bnb: "binancecoin",
+  xrp: "ripple",
+  doge: "dogecoin",
+  ada: "cardano",
+  matic: "matic-network",
+  polygon: "matic-network",
+  pol: "matic-network",
+  avax: "avalanche-2",
+  link: "chainlink",
+  dot: "polkadot",
+  ltc: "litecoin",
+  arb: "arbitrum",
+  op: "optimism",
+};
+
+function toCoinId(s: string): string {
+  const k = s.trim().toLowerCase();
+  return TICKER_TO_ID[k] ?? k.replace(/\s+/g, "-");
+}
+
+export const getCryptoPrice = tool({
+  description:
+    "Get the current price of one or more cryptocurrencies from CoinGecko (accurate, single authoritative source). Use this for ANY crypto price question instead of web search. Pays a tiny USDC fee (auto). Accepts names or tickers like 'bitcoin', 'btc', or 'eth, sol'.",
+  inputSchema: z.object({
+    coins: z
+      .string()
+      .describe("One or more coins, comma-separated. Names or tickers, e.g. 'bitcoin' or 'btc, eth, sol'"),
+    vsCurrency: z
+      .string()
+      .optional()
+      .default("usd")
+      .describe("Fiat currency, e.g. usd, eur, gbp. Default usd."),
+  }),
+  execute: async ({ coins, vsCurrency }) => {
+    const ids = coins.split(",").map(toCoinId).filter(Boolean).join(",");
+    if (!ids) return { error: "Give me at least one coin, e.g. bitcoin." };
+    const vs = (vsCurrency ?? "usd").toLowerCase();
+    const url =
+      `${CRYPTO_PRICE_URL}?ids=${encodeURIComponent(ids)}&vs_currencies=${encodeURIComponent(vs)}` +
+      `&include_24hr_change=true&include_market_cap=true`;
+
+    const res = await autoPaidCall(url);
+    if (!res.ok) return { error: res.error };
+
+    const body = unwrapResponse(res.data) ?? {};
+    const prices: Record<string, unknown> = {};
+    for (const [coin, v] of Object.entries(body)) {
+      if (coin === "payment" || !v || typeof v !== "object") continue;
+      const o = v as Record<string, number>;
+      const change = o[`${vs}_24h_change`];
+      prices[coin] = {
+        price: o[vs],
+        currency: vs.toUpperCase(),
+        marketCap: o[`${vs}_market_cap`],
+        change24h: typeof change === "number" ? `${change.toFixed(2)}%` : undefined,
+      };
+    }
+    if (Object.keys(prices).length === 0) {
+      return { error: `No price data for "${coins}". Use a valid coin name or ticker.`, raw: body };
+    }
+    return { prices, source: "CoinGecko", note: "Accurate single-source price. Report these numbers exactly." };
   },
 });
 

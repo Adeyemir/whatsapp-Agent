@@ -1,6 +1,6 @@
 # Friday — WhatsApp AI Agent + Circle Wallet
 
-A general-purpose AI agent that lives natively on WhatsApp. It runs on Groq (Llama 3.3 70B), can execute shell commands, remembers your conversation across restarts, and holds a Circle USDC wallet so it can pay for x402 marketplace services when it cannot do something itself.
+A general-purpose AI agent that lives natively on WhatsApp. It runs on Groq (gpt-oss-120b), can execute shell commands, remembers your conversation across restarts, and holds a Circle USDC wallet so it can pay for x402 marketplace services when it cannot do something itself.
 
 ## Architecture
 
@@ -132,4 +132,4 @@ You control what is auto-approved via `ALLOWED_COMMAND_PREFIXES` in `.env`.
 ## Notes
 
 - The Twilio WhatsApp sandbox caps you at 50 messages per day. Moving to production needs a WhatsApp Business API sender.
-- `llama-3.3-70b-versatile` is the most reliable Groq model for tool calling. The agent retries and falls back to a plain text answer if Groq emits a malformed tool call.
+- `openai/gpt-oss-120b` is the most reliable Groq model for tool calling. Llama models on Groq often emit malformed tool calls. The agent still retries and falls back to a plain text answer if a malformed tool call slips through.

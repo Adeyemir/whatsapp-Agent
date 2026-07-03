@@ -7,6 +7,7 @@ import { calculator, getDateTime, getWeather } from "./tools/builtin.js";
 import {
   webSearch,
   analyzeXAccount,
+  getCryptoPrice,
   checkWalletBalance,
   checkGatewayBalance,
   getTotalBalance,
@@ -212,6 +213,7 @@ async function runLLM(conversationId: string): Promise<string> {
     // Free built-in tools
     webSearch,
     analyzeXAccount,
+    getCryptoPrice,
     calculator,
     getDateTime,
     getWeather,

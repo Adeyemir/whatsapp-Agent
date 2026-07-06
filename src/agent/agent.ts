@@ -1,4 +1,6 @@
 import { createOpenAI } from "@ai-sdk/openai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { createAnthropic } from "@ai-sdk/anthropic";
 import { generateText, stepCountIs } from "ai";
 import { config } from "../config.js";
 import { getHistory, addMessage, clearHistory } from "../memory/store.js";
@@ -6,6 +8,7 @@ import { buildSystemPrompt } from "./system-prompt.js";
 import { calculator, getDateTime, getWeather } from "./tools/builtin.js";
 import {
   webSearch,
+  tokenSearch,
   analyzeXAccount,
   checkWalletBalance,
   checkGatewayBalance,
@@ -15,6 +18,8 @@ import {
   payForService,
   discoverServices,
   getWalletAddress,
+  gatewayDeposit,
+  gatewayWithdraw,
 } from "./tools/circle.js";
 import {
   executeCommand,
@@ -24,13 +29,21 @@ import {
   executeApprovedCommand,
 } from "./tools/shell.js";
 
-// Initialise Groq via OpenAI-compatible provider
+// Initialise Groq client
 const groq = createOpenAI({
-  apiKey: config.GROQ_API_KEY,
+  apiKey: config.GROQ_API_KEY || "",
   baseURL: "https://api.groq.com/openai/v1",
 });
-// Note: always call groq.chat(model) — it targets /chat/completions.
-// The default groq(model) would hit /responses, which Groq doesn't support.
+
+// Initialise Google Gemini client
+const google = createGoogleGenerativeAI({
+  apiKey: config.GEMINI_API_KEY || "",
+});
+
+// Initialise Anthropic Claude client
+const anthropic = createAnthropic({
+  apiKey: config.ANTHROPIC_API_KEY || "",
+});
 
 // Approval detection
 const APPROVAL_PHRASES = [
@@ -48,6 +61,55 @@ function isDenial(text: string): boolean {
   return ["no", "nah", "nope", "cancel", "stop", "don't", "deny"].some(
     (p) => lower.startsWith(p)
   );
+}
+
+/**
+ * Convert Zod schemas to OpenAPI schemas for OpenRouter compatibility.
+ */
+function zodToOpenApi(zodSchema: any): any {
+  if (!zodSchema || zodSchema._def?.typeName !== "ZodObject") {
+    return { type: "object", properties: {} };
+  }
+
+  const shape = zodSchema.shape;
+  const properties: any = {};
+  const required: string[] = [];
+
+  for (const key of Object.keys(shape)) {
+    const field = shape[key];
+    let unwrapped = field;
+    
+    // Unwrap optional and default values to get the core Zod type
+    while (unwrapped._def?.innerType || unwrapped._def?.schema) {
+      unwrapped = unwrapped._def.innerType || unwrapped._def.schema;
+    }
+    
+    const typeName = unwrapped._def?.typeName;
+    const description = field.description || unwrapped.description;
+    const fieldSchema: any = {};
+
+    if (typeName === "ZodString") fieldSchema.type = "string";
+    else if (typeName === "ZodNumber") fieldSchema.type = "number";
+    else if (typeName === "ZodBoolean") fieldSchema.type = "boolean";
+    else if (typeName === "ZodEnum") {
+      fieldSchema.type = "string";
+      fieldSchema.enum = unwrapped._def.values;
+    }
+
+    if (description) fieldSchema.description = description;
+    properties[key] = fieldSchema;
+
+    // If it has no optional wrapper, mark it as required
+    if (field._def?.typeName !== "ZodOptional" && field._def?.typeName !== "ZodDefault") {
+      required.push(key);
+    }
+  }
+
+  return {
+    type: "object",
+    properties,
+    required: required.length > 0 ? required : undefined,
+  };
 }
 
 /**
@@ -94,12 +156,12 @@ export async function runAgent(
   if (text === "/balance") {
     // Direct shortcut — resolve the agent wallet address first, then query balance
     try {
-      const address = await getWalletAddress("BASE");
+      const address = await getWalletAddress(config.DEFAULT_CHAIN);
       if (!address) {
-        return "No agent wallet found on BASE. Say 'create my wallet' to set one up.";
+        return `No agent wallet found on ${config.DEFAULT_CHAIN}. Say 'create my wallet' to set one up.`;
       }
       const result = await executeApprovedCommand(
-        `circle wallet balance --chain BASE --address ${address} --output json`
+        `circle wallet balance --chain ${config.DEFAULT_CHAIN} --address ${address} --output json`
       );
       return result;
     } catch (err) {
@@ -110,12 +172,12 @@ export async function runAgent(
   if (text === "/gateway") {
     // Cross-chain Gateway (nanopayments) balance — the pool that pays for services
     try {
-      const address = await getWalletAddress("BASE");
+      const address = await getWalletAddress(config.DEFAULT_CHAIN);
       if (!address) {
         return "No agent wallet found. Say 'create my wallet' to set one up.";
       }
       const result = await executeApprovedCommand(
-        `circle gateway balance --address ${address} --chain BASE --all --output json`
+        `circle gateway balance --address ${address} --chain ${config.DEFAULT_CHAIN} --all --output json`
       );
       return result;
     } catch (err) {
@@ -211,6 +273,7 @@ async function runLLM(conversationId: string): Promise<string> {
   const allTools = {
     // Free built-in tools
     webSearch,
+    tokenSearch,
     analyzeXAccount,
     calculator,
     getDateTime,
@@ -227,7 +290,111 @@ async function runLLM(conversationId: string): Promise<string> {
     getWalletStatus,
     payForService,
     discoverServices,
+    gatewayDeposit,
+    gatewayWithdraw,
   };
+
+  if (config.LLM_PROVIDER === "openrouter") {
+    // Convert Friday's tools to OpenAPI format dynamically
+    const openApiTools = Object.entries(allTools).map(([name, toolObj]: [string, any]) => ({
+      type: "function" as const,
+      function: {
+        name,
+        description: toolObj.description,
+        parameters: zodToOpenApi(toolObj.inputSchema),
+      },
+    }));
+
+    // Local array tracking messages for this conversation turn
+    const messages = [
+      { role: "system", content: systemPrompt },
+      ...history.map((m) => ({
+        role: m.role as "user" | "assistant" | "tool",
+        content: m.content,
+        tool_calls: (m as any).tool_calls,
+        tool_call_id: (m as any).tool_call_id,
+        name: (m as any).name,
+      })),
+    ];
+
+    while (true) {
+      try {
+        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${config.OPENROUTER_API_KEY}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/Friday-Agent",
+            "X-Title": "Friday WhatsApp Agent",
+          },
+          body: JSON.stringify({
+            model: config.OPENROUTER_MODEL,
+            messages,
+            tools: openApiTools,
+            temperature: 0.4,
+          }),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+
+        const data: any = await response.json();
+        const choice = data.choices?.[0];
+        const message = choice?.message;
+
+        if (!message) throw new Error("No message returned from OpenRouter");
+
+        // 1. Check if model requested tool calls
+        if (message.tool_calls && message.tool_calls.length > 0) {
+          messages.push(message);
+
+          for (const toolCall of message.tool_calls) {
+            const toolName = toolCall.function.name;
+            const toolArgs = JSON.parse(toolCall.function.arguments);
+
+            console.log(`🔧 [OpenRouter] Executing tool: ${toolName}`, toolArgs);
+
+            const toolObj = (allTools as any)[toolName];
+            let resultText = "";
+
+            if (toolObj) {
+              try {
+                const output = await toolObj.execute(toolArgs);
+                resultText = JSON.stringify(output);
+              } catch (e: any) {
+                console.error(`❌ Error executing tool ${toolName}:`, e);
+                resultText = JSON.stringify({ error: e.message });
+              }
+            } else {
+              resultText = JSON.stringify({ error: `Tool ${toolName} not found` });
+            }
+
+            messages.push({
+              role: "tool",
+              tool_call_id: toolCall.id,
+              name: toolName,
+              content: resultText,
+            });
+          }
+
+          // Loop again to feed tool outputs back to OpenRouter
+          continue;
+        }
+
+        // 2. Final conversational reply
+        const reply = message.content || "";
+        if (reply) {
+          addMessage(conversationId, { role: "assistant", content: reply });
+        }
+        return reply || "I processed your request but didn't generate a text response.";
+      } catch (err: any) {
+        console.error("❌ OpenRouter tool loop error:", err.message);
+        return "Something went wrong when communicating with OpenRouter. Please try again.";
+      }
+    }
+  }
 
   const MAX_ATTEMPTS = 3;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -235,8 +402,17 @@ async function runLLM(conversationId: string): Promise<string> {
     // is forced to answer in plain text instead of failing again.
     const useTools = attempt < MAX_ATTEMPTS;
     try {
+      let model;
+      if (config.LLM_PROVIDER === "gemini") {
+        model = google(config.GEMINI_MODEL);
+      } else if (config.LLM_PROVIDER === "anthropic") {
+        model = anthropic(config.ANTHROPIC_MODEL);
+      } else {
+        model = groq.chat(config.GROQ_MODEL);
+      }
+
       const result = await generateText({
-        model: groq.chat(config.GROQ_MODEL),
+        model: model as any,
         temperature: 0.4,
         system: systemPrompt,
         messages: history.map((m) => ({

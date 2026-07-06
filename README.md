@@ -1,26 +1,27 @@
 # Friday — WhatsApp AI Agent + Circle Wallet
 
-A general-purpose AI agent that lives natively on WhatsApp. It runs on Groq (Llama 3.3 70B), can execute shell commands, remembers your conversation across restarts, and holds a Circle USDC wallet so it can pay for x402 marketplace services when it cannot do something itself.
+A general-purpose AI agent that lives natively on WhatsApp. It runs on your choice of LLM (OpenRouter, Google Gemini, or Groq), can execute shell commands, remembers your conversation across restarts, and holds a Circle USDC wallet so it can pay for x402 marketplace services to automate tasks.
 
 ## Architecture
 
 ```
-You (WhatsApp) → Twilio → ngrok → Express webhook → Groq brain → Tools
+You (WhatsApp) → Twilio → ngrok → Express webhook → AI Brain → Tools
                                                         │
-                          ┌─────────────────────────────┼─────────────────────────────┐
-                          │                             │                             │
-                     Free tools                    Shell / URL                   Circle CLI
-                (weather, calc,                (run commands,               (wallet + Gateway,
-                 date/time)                     fetch pages)                 pay x402 services)
-                                                                                   │
+                           ┌─────────────────────────────┼─────────────────────────────┐
+                           │                             │                             │
+                      Free tools                    Shell / URL                   Circle CLI
+                 (weather, calc,                (run commands,               (wallet + Gateway,
+                  date/time)                     fetch pages)                 pay x402 services)
+                                                                                    │
                                                                     Paid via marketplace (x402):
-                                                                    web search, X account analysis
+                                                                    web search, token search,
+                                                                    X account analysis
 ```
 
 ## What it can do
 
 ### Free (built-in)
-- Maths and calculations
+- Maths and calculations (calculator)
 - Weather for any city (Open-Meteo, no key needed)
 - Date and time in any timezone
 - Shell command execution (with safety controls)
@@ -28,16 +29,19 @@ You (WhatsApp) → Twilio → ngrok → Express webhook → Groq brain → Tools
 
 ### Paid per use (via the Circle x402 marketplace)
 Friday pays a fraction of a cent from your wallet, automatically for small amounts:
-- Web search for current facts and news (Tavily via the marketplace)
-- X / Twitter account analysis (real profile stats and recent tweets)
-- Any other x402 service it discovers: it inspects the seller, tells you the cost, and asks before paying anything above the auto cap
+- **Web search**: Search the web for current facts and news (Tavily/AIsa via the marketplace, or direct free search via Brave API).
+- **Token search**: Look up cryptocurrency token details, names, contract addresses, and statistics across chains (Allium API via the marketplace).
+- **X / Twitter account analysis**: Look up real profile stats and recent tweets.
+- **Any other x402 service**: It inspects the seller, tells you the cost, and asks before paying anything above the auto cap.
 
 ### Two balances, spent correctly
 The Circle agent wallet holds two separate USDC pools:
-- On-chain balance, held per blockchain (vanilla x402)
-- Gateway balance, a cross-chain nanopayments pool
+- **On-chain balance**, held per blockchain (vanilla x402)
+- **Gateway balance**, a cross-chain nanopayments pool
 
 When Friday pays, it inspects each seller's accepted chains and schemes, checks both pools, and pays on a chain that actually works, preferring Gateway when the seller supports it.
+
+---
 
 ## Setup
 
@@ -56,13 +60,16 @@ cp .env.example .env
 
 Fill in your `.env`:
 
-| Key | Where to get it |
-|---|---|
-| `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` | [console.twilio.com](https://console.twilio.com) → Account Info |
-| `TWILIO_WHATSAPP_NUMBER` | The Twilio sandbox number, `whatsapp:+14155238886` |
-| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com), free |
-
-Web search needs no key. It runs through the Circle marketplace and is paid per call from your wallet (see `SEARCH_SERVICE_URL` and `SEARCH_MAX_AUTO_USDC`).
+| Key | Description | Where to get it |
+|---|---|---|
+| `LLM_PROVIDER` | Choose between: `openrouter`, `gemini`, or `groq` | — |
+| `OPENROUTER_API_KEY` | OpenRouter API Key (e.g. `openai/gpt-4o-mini`) | [openrouter.ai](https://openrouter.ai/) |
+| `GEMINI_API_KEY` | Google Gemini API Key | [aistudio.google.com](https://aistudio.google.com/) |
+| `GROQ_API_KEY` | Groq Llama API Key | [console.groq.com](https://console.groq.com/) |
+| `TWILIO_ACCOUNT_SID` + `TWILIO_AUTH_TOKEN` | Twilio Account SID & Auth Token | [console.twilio.com](https://console.twilio.com) → Account Info |
+| `TWILIO_WHATSAPP_NUMBER` | The Twilio sandbox number | `whatsapp:+14155238886` |
+| `DEFAULT_CHAIN` | Default blockchain network (e.g. `BASE` or `BASE-SEPOLIA`) | — |
+| `BRAVE_SEARCH_API_KEY` | (Optional) Direct free web search API key | [search.brave.com](https://search.brave.com/api) |
 
 ### 3. Install the Circle CLI
 
@@ -102,6 +109,8 @@ Set up my Circle agent wallet
 
 Friday reads the Circle setup instructions and walks you through accepting terms, logging in, and creating the wallet, all from WhatsApp.
 
+---
+
 ## WhatsApp Commands
 
 | Command | What it does |
@@ -114,6 +123,13 @@ Friday reads the Circle setup instructions and walks you through accepting terms
 | `/setup` | Start Circle wallet setup |
 | `/services` | Browse marketplace services |
 | `/reset` | Clear conversation history |
+
+---
+
+## Gateway Transfers (WhatsApp instructions)
+You can transfer USDC to and from your Gateway pool directly using plain text commands:
+*   **Deposit**: *"Deposit 1 USDC to the Gateway"*
+*   **Withdrawal**: *"Withdraw 1 USDC from my Gateway balance"* (Or: *"Withdraw 1 USDC from my Gateway balance on MATIC"*)
 
 ## Memory
 
@@ -128,8 +144,3 @@ The agent can run shell commands, but with guardrails:
 - Hard-blocked: destructive commands (`rm -rf /`, `mkfs`, and similar)
 
 You control what is auto-approved via `ALLOWED_COMMAND_PREFIXES` in `.env`.
-
-## Notes
-
-- The Twilio WhatsApp sandbox caps you at 50 messages per day. Moving to production needs a WhatsApp Business API sender.
-- `llama-3.3-70b-versatile` is the most reliable Groq model for tool calling. The agent retries and falls back to a plain text answer if Groq emits a malformed tool call.

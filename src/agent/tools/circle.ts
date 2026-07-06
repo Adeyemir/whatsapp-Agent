@@ -2,6 +2,7 @@ import { tool } from "ai";
 import { z } from "zod";
 import { exec } from "child_process";
 import { config } from "../../config.js";
+import axios from "axios";
 
 /**
  * Run a circle CLI command and return parsed JSON output.
@@ -12,9 +13,14 @@ function circleCmd(
   return new Promise((resolve) => {
     exec(
       `circle ${args} --output json`,
-      { timeout: 30_000, env: { ...process.env, FORCE_COLOR: "0" } },
+      { timeout: 180_000, env: { ...process.env, FORCE_COLOR: "0" } },
       (error, stdout, stderr) => {
         const raw = stdout?.toString() ?? stderr?.toString() ?? "";
+        if (error) {
+          console.error(`❌ Circle CLI command failed: "circle ${args}"`);
+          console.error(`   Exit code: ${error.code ?? "unknown"}`);
+          console.error(`   Output/Error: ${raw.trim() || error.message}`);
+        }
         try {
           const data = JSON.parse(raw);
           resolve({ success: !error, data, raw });
@@ -30,7 +36,7 @@ function circleCmd(
  * Get the agent wallet address for a given chain.
  * Uses `circle wallet list --type agent --chain <chain>`.
  */
-export async function getWalletAddress(chain = "BASE"): Promise<string | null> {
+export async function getWalletAddress(chain = config.DEFAULT_CHAIN): Promise<string | null> {
   const result = await circleCmd(`wallet list --type agent --chain ${chain}`);
   if (!result.success) return null;
   const d = result.data as { data?: { wallets?: Array<{ address: string }> } };
@@ -48,13 +54,16 @@ export const checkWalletBalance = tool({
     chain: z
       .string()
       .optional()
-      .default("BASE")
+      .default(config.DEFAULT_CHAIN)
       .describe(
-        "Blockchain to check balance on. Valid values: BASE, ETH, MATIC (Polygon), ARB (Arbitrum), AVAX (Avalanche), OP (Optimism), UNI (Unichain). Default: BASE"
+        `Blockchain to check balance on. Valid values: BASE, ETH, MATIC (Polygon), ARB (Arbitrum), AVAX (Avalanche), OP (Optimism), UNI (Unichain), and testnets. Default: ${config.DEFAULT_CHAIN}`
       ),
   }),
   execute: async ({ chain }) => {
-    const chainName = chain ?? "BASE";
+    let chainName = chain ?? config.DEFAULT_CHAIN;
+    if (chainName === "BASE" && config.DEFAULT_CHAIN.includes("SEPOLIA")) {
+      chainName = config.DEFAULT_CHAIN;
+    }
     const address = await getWalletAddress(chainName);
     if (!address) {
       return {
@@ -99,14 +108,14 @@ export const checkGatewayBalance = tool({
     "Check the agent's Circle GATEWAY balance (the cross-chain USDC nanopayments pool used to pay for x402 marketplace services). This is DIFFERENT from the on-chain wallet balance: use this when the user asks about their Gateway balance, nanopayments balance, or 'how much can I spend on services'. It reports a unified total plus a per-chain breakdown.",
   inputSchema: z.object({}),
   execute: async () => {
-    const address = await getWalletAddress("BASE");
+    const address = await getWalletAddress(config.DEFAULT_CHAIN);
     if (!address) {
       return { error: "No agent wallet found. Say 'create my wallet' to set one up." };
     }
     // Gateway balance is cross-chain; --chain just names where the wallet lives.
     // --all includes zero-balance chains so we can show a full picture.
     const result = await circleCmd(
-      `gateway balance --address ${address} --chain BASE --all`
+      `gateway balance --address ${address} --chain ${config.DEFAULT_CHAIN} --all`
     );
     if (!result.success) {
       return {
@@ -131,6 +140,96 @@ export const checkGatewayBalance = tool({
   },
 });
 
+// ─── Gateway Deposit & Withdraw ───────────────────────────────────────────────
+
+export const gatewayDeposit = tool({
+  description:
+    "Deposit USDC from the agent's on-chain wallet into the Circle Gateway pool for nanopayments. This funds Friday's ability to pay for services.",
+  inputSchema: z.object({
+    amount: z.string().describe("Amount of USDC to deposit, e.g. '0.5' or '5.0'"),
+    chain: z
+      .string()
+      .optional()
+      .describe(
+        `Source blockchain chain to deposit from. Default: ${config.DEFAULT_CHAIN}`
+      ),
+  }),
+  execute: async ({ amount, chain }) => {
+    let chainName = chain ?? config.DEFAULT_CHAIN;
+    if (chainName === "BASE" && config.DEFAULT_CHAIN.includes("SEPOLIA")) {
+      chainName = config.DEFAULT_CHAIN;
+    }
+    const address = await getWalletAddress(chainName);
+    if (!address) {
+      return { error: `No agent wallet found on ${chainName}.` };
+    }
+
+    // Agent wallets must specify --method. eco is fast/gasless for Base.
+    const isBase = chainName.toUpperCase().startsWith("BASE");
+    const method = isBase ? "eco" : "direct";
+
+    const cmd = `gateway deposit --amount ${amount} --address ${address} --chain ${chainName} --method ${method}`;
+    const result = await circleCmd(cmd);
+
+    if (!result.success) {
+      return {
+        error: `Deposit failed on ${chainName}.`,
+        raw: result.raw,
+      };
+    }
+    return {
+      success: true,
+      amount,
+      chain: chainName,
+      method,
+      message: `Successfully deposited ${amount} USDC from on-chain wallet to Gateway on ${chainName}.`,
+      raw: result.data,
+    };
+  },
+});
+
+export const gatewayWithdraw = tool({
+  description:
+    "Withdraw USDC from the Circle Gateway pool back to the agent's on-chain wallet.",
+  inputSchema: z.object({
+    amount: z.string().describe("Amount of USDC to withdraw, e.g. '0.5' or '5.0'"),
+    chain: z
+      .string()
+      .optional()
+      .describe(
+        `Destination blockchain chain to receive withdrawn USDC. Default: ${config.DEFAULT_CHAIN}`
+      ),
+  }),
+  execute: async ({ amount, chain }) => {
+    let chainName = chain ?? config.DEFAULT_CHAIN;
+    if (chainName === "BASE" && config.DEFAULT_CHAIN.includes("SEPOLIA")) {
+      chainName = config.DEFAULT_CHAIN;
+    }
+    const address = await getWalletAddress(chainName);
+    if (!address) {
+      return { error: `No agent wallet found on ${chainName}.` };
+    }
+
+    const cmd = `gateway withdraw --amount ${amount} --address ${address} --chain ${chainName}`;
+    const result = await circleCmd(cmd);
+
+    if (!result.success) {
+      return {
+        error: `Withdraw failed on ${chainName}.`,
+        raw: result.raw,
+      };
+    }
+    return {
+      success: true,
+      amount,
+      chain: chainName,
+      message: `Successfully withdrew ${amount} USDC from Gateway back to your on-chain wallet on ${chainName}.`,
+      raw: result.data,
+    };
+  },
+});
+
+
 // ─── Total Balance (computed in code, never by the model) ─────────────────────
 
 // USDC has 6 decimals. We sum in integer micro-USDC to avoid float drift,
@@ -139,7 +238,7 @@ const USDC_DECIMALS = 6;
 const MICRO = 10 ** USDC_DECIMALS;
 
 // On-chain chains with a default public RPC in the Circle CLI (ETH has none).
-const ONCHAIN_CHAINS = ["BASE", "MATIC", "ARB"] as const;
+const ONCHAIN_CHAINS = [config.DEFAULT_CHAIN, "MATIC", "ARB"];
 
 function toMicro(amount: string | number): number {
   return Math.round(Number(amount) * MICRO);
@@ -163,7 +262,7 @@ async function onchainUsdcMicro(address: string, chain: string): Promise<number>
 
 /** Gateway (nanopayments) USDC total, in micro-USDC. */
 async function gatewayUsdcMicro(address: string): Promise<number> {
-  const result = await circleCmd(`gateway balance --address ${address} --chain BASE --all`);
+  const result = await circleCmd(`gateway balance --address ${address} --chain ${config.DEFAULT_CHAIN} --all`);
   if (!result.success) return 0;
   const total = (result.data as { data?: { total?: string } })?.data?.total ?? "0";
   return toMicro(total);
@@ -175,20 +274,21 @@ const NETWORK_TO_CLI_CHAIN: Record<string, string> = {
   "1": "ETH",
   "137": "MATIC",
   "42161": "ARB",
-  "8453": "BASE",
+  "8453": config.DEFAULT_CHAIN,
+  "84532": config.DEFAULT_CHAIN,
 };
 // Gateway "domain" number -> CLI chain, for reading the per-chain Gateway split.
 const GATEWAY_DOMAIN_TO_CLI: Record<number, string> = {
   0: "ETH",
   3: "ARB",
-  6: "BASE",
+  6: config.DEFAULT_CHAIN,
   7: "MATIC",
 };
 
 /** Gateway balance per CLI chain, in micro-USDC (e.g. { MATIC: 2442076 }). */
 async function gatewayBalancesByChain(address: string): Promise<Record<string, number>> {
   const out: Record<string, number> = {};
-  const result = await circleCmd(`gateway balance --address ${address} --chain BASE --all`);
+  const result = await circleCmd(`gateway balance --address ${address} --chain ${config.DEFAULT_CHAIN} --all`);
   if (!result.success) return out;
   const balances =
     (result.data as { data?: { balances?: Array<{ domain: number; balance: string }> } })
@@ -228,7 +328,10 @@ function fetchAccepts(url: string, method: string): Promise<Accept[]> {
     m === "GET" ? "" : ` -X ${m} -H 'Content-Type: application/json' -d '{}'`;
   const cmd = `curl -sS --max-time 20${bodyArgs} "${url}"`;
   return new Promise((resolve) => {
-    exec(cmd, { timeout: 25_000 }, (_error, stdout) => {
+    exec(cmd, { timeout: 25_000 }, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`❌ fetchAccepts curl command failed for ${url}:`, error.message, stderr?.toString() ?? "");
+      }
       try {
         const body = JSON.parse(stdout?.toString() ?? "");
         resolve(Array.isArray(body?.accepts) ? (body.accepts as Accept[]) : []);
@@ -284,7 +387,7 @@ export type TotalBalance =
  * number is never produced by the model's arithmetic.
  */
 export async function computeTotalBalance(): Promise<TotalBalance> {
-  const address = await getWalletAddress("BASE");
+  const address = await getWalletAddress(config.DEFAULT_CHAIN);
   if (!address) {
     return { error: "No agent wallet found. Say 'create my wallet' to set one up." };
   }
@@ -321,11 +424,11 @@ export const getWalletStatus = tool({
     "Get the agent wallet address and status. Use when the user asks for their wallet address or wants to fund the agent. Returns address, chain, and auth status.",
   inputSchema: z.object({}),
   execute: async () => {
-    const address = await getWalletAddress("BASE");
+    const address = await getWalletAddress(config.DEFAULT_CHAIN);
     const authResult = await circleCmd("wallet status");
     return {
       address: address ?? "No wallet found — say 'create my wallet' to set one up",
-      chain: "BASE",
+      chain: config.DEFAULT_CHAIN,
       auth: authResult.data,
     };
   },
@@ -386,7 +489,7 @@ export async function preparePayment(
   serviceUrl: string,
   method?: string
 ): Promise<PreparedPayment> {
-  const address = await getWalletAddress("BASE");
+  const address = await getWalletAddress(config.DEFAULT_CHAIN);
   if (!address) {
     return { ok: false, error: "No agent wallet found. Set up your Circle wallet first." };
   }
@@ -534,7 +637,7 @@ function extractSearchResults(
 
 export const webSearch = tool({
   description:
-    "Search the web for current information, news, facts, prices, or anything you may not know or that could have changed. This uses a paid marketplace service (a small USDC fee per search, already pre-authorized up to a cap). Prefer this over answering from memory for anything current or factual.",
+    "Search the web for current information, news, facts, prices, or anything you may not know or that could have changed. Prefer this over answering from memory for anything current or factual.",
   inputSchema: z.object({
     query: z.string().describe("The search query"),
     topic: z
@@ -548,6 +651,31 @@ export const webSearch = tool({
       .describe("Only needed if a search costs more than the auto-pay cap. Set true after the user approves the higher cost."),
   }),
   execute: async ({ query, topic, confirmed }) => {
+    // 1. Check if direct Brave API key is configured
+    if (config.BRAVE_SEARCH_API_KEY) {
+      try {
+        const response = await axios.get("https://api.search.brave.com/res/v1/web/search", {
+          params: { q: query, count: 5 },
+          headers: {
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": config.BRAVE_SEARCH_API_KEY,
+          },
+        });
+        const results = (response.data?.web?.results ?? []).map((r: any) => ({
+          title: r.title,
+          url: r.url,
+          content: (r.description ?? "").slice(0, 300),
+        }));
+        if (results.length > 0) {
+          return { query, paidVia: "Brave API (Free)", results };
+        }
+      } catch (err: any) {
+        console.warn("⚠️ Brave search failed, falling back to Circle Marketplace search:", err?.message);
+      }
+    }
+
+    // 2. Fallback to Circle Marketplace search
     const url = config.SEARCH_SERVICE_URL;
     const body = JSON.stringify({ query, topic: topic ?? "general" });
 
@@ -566,7 +694,10 @@ export const webSearch = tool({
     }
 
     const paid = await runPay(url, plan.address, plan.chain, plan.method, priceUsdc, body);
-    if (!paid.success) return { error: `Search failed: ${paid.error}` };
+    if (!paid.success) {
+      console.error("❌ webSearch paid call failed. Raw Error:", paid.error);
+      return { error: `Search failed: ${paid.error}` };
+    }
 
     const results = extractSearchResults(paid.data)
       .slice(0, 5)
@@ -576,9 +707,47 @@ export const webSearch = tool({
         content: (r.content ?? "").slice(0, 300),
       }));
     if (results.length === 0) {
+      console.warn("⚠️ webSearch returned no parseable results. Raw response:", JSON.stringify(paid.data));
       return { query, costUsdc: priceUsdc, note: "Search returned no parseable results.", raw: paid.data };
     }
     return { query, costUsdc: priceUsdc, paidVia: `${plan.rail} on ${plan.chain}`, results };
+  },
+});
+
+// ─── Token Search (paid via marketplace Allium registry) ─────────────────────
+
+export const tokenSearch = tool({
+  description:
+    "Search for cryptocurrency tokens by name, symbol, or contract address across supported blockchains (Base, Ethereum, Polygon, Arbitrum, Solana, etc.) using Allium registry. Costs 0.03 USDC.",
+  inputSchema: z.object({
+    query: z.string().describe("The token name, symbol, or contract address to search for (e.g. 'USDC' or 'UNI')"),
+    confirmed: z
+      .boolean()
+      .optional()
+      .default(false)
+      .describe("Set true ONLY after the user has explicitly approved the 0.03 USDC cost."),
+  }),
+  execute: async ({ query, confirmed }) => {
+    const url = `https://agents.allium.so/api/v1/developer/tokens/search?q=${encodeURIComponent(query)}`;
+    const plan = await preparePayment(url);
+    if (!plan.ok) return { error: plan.error };
+    const priceUsdc = fromMicro(plan.priceMicro);
+
+    if (!confirmed) {
+      return {
+        needsConfirmation: true,
+        priceUsdc,
+        message: `Ready to pay ${priceUsdc} USDC to search for token '${query}', using your ${plan.rail} balance on ${plan.chain}. Reply yes to confirm.`,
+      };
+    }
+
+    const paid = await runPay(url, plan.address, plan.chain, plan.method, priceUsdc);
+    if (!paid.success) {
+      console.error("❌ tokenSearch paid call failed. Raw Error:", paid.error);
+      return { error: `Token search failed: ${paid.error}` };
+    }
+
+    return { query, costUsdc: priceUsdc, paidVia: `${plan.rail} on ${plan.chain}`, results: paid.data };
   },
 });
 
@@ -601,7 +770,10 @@ async function autoPaidCall(
     };
   }
   const paid = await runPay(url, plan.address, plan.chain, plan.method, fromMicro(plan.priceMicro), data);
-  if (!paid.success) return { ok: false, error: paid.error ?? "payment failed" };
+  if (!paid.success) {
+    console.error("❌ autoPaidCall payment failed. Raw Error:", paid.error);
+    return { ok: false, error: paid.error ?? "payment failed" };
+  }
   return { ok: true, data: paid.data };
 }
 
@@ -697,7 +869,7 @@ export const discoverServices = tool({
   execute: async ({ query }) => {
     const args = query
       ? `services search "${query}"`
-      : "services list";
+      : 'services search ""';
     const result = await circleCmd(args);
     if (!result.success) {
       return {

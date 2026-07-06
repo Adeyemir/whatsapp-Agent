@@ -59,7 +59,7 @@ app.post("/webhook", async (req: Request, res: Response) => {
   setImmediate(async () => {
     try {
       const reply = await runAgent(conversationId, incomingText);
-      console.log(`📤  [${conversationId}]: ${reply.substring(0, 80)}`);
+      console.log(`📤  [${conversationId}]: ${reply}`);
 
       // Send the reply via Twilio REST API
       const client = twilio(config.TWILIO_ACCOUNT_SID, config.TWILIO_AUTH_TOKEN);
@@ -78,7 +78,17 @@ app.post("/webhook", async (req: Request, res: Response) => {
 async function main() {
   console.log(`\n🤖  ${config.AGENT_NAME} — WhatsApp AI Agent`);
   console.log("──────────────────────────────────────────");
-  console.log(`🧠  LLM: Groq (${config.GROQ_MODEL})`);
+  let llmDetails = "";
+  if (config.LLM_PROVIDER === "gemini") {
+    llmDetails = `Gemini (${config.GEMINI_MODEL})`;
+  } else if (config.LLM_PROVIDER === "anthropic") {
+    llmDetails = `Anthropic (${config.ANTHROPIC_MODEL})`;
+  } else if (config.LLM_PROVIDER === "openrouter") {
+    llmDetails = `OpenRouter (${config.OPENROUTER_MODEL})`;
+  } else {
+    llmDetails = `Groq (${config.GROQ_MODEL})`;
+  }
+  console.log(`🧠  LLM: ${llmDetails}`);
   console.log(`📱  Transport: Twilio WhatsApp Sandbox`);
 
   // Check Circle CLI

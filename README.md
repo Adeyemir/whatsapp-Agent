@@ -16,6 +16,8 @@ This repository is a **single-owner local app**, tested with the Twilio WhatsApp
 
 Friday discovers marketplace endpoints for a task instead of relying on a fixed finance API list. It shows the provider, purpose, and maximum price before a new marketplace call. Reply `yes` or `no`; reply `details` to inspect the technical request. A successful paid response is saved locally so Friday can continue a report without paying for the same response again. Email delivery depends on finding and successfully calling a suitable service; Friday does not claim an email was sent without its response.
 
+WhatsApp replies use short paragraphs and plain section labels for longer reports. Source quotations are attributed, and wallet confirmations keep amounts, addresses, and transaction links easy to scan.
+
 Selected search, crypto-price, and X-data tools can make small payments automatically, up to `SEARCH_MAX_AUTO_USDC` per call. A general marketplace call requires its own WhatsApp approval and is capped by `MARKETPLACE_MAX_USDC_PER_CALL`. Availability and cost come from live service quotes, so requests can fail when a provider, compatible payment route, or wallet balance is unavailable.
 
 ## How USDC moves

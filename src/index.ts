@@ -4,7 +4,7 @@ import { exec } from "child_process";
 import twilio from "twilio";
 import axios from "axios";
 import { runAgent } from "./agent/agent.js";
-import { plainWhatsAppText } from "./agent/whatsapp-format.js";
+import { plainWhatsAppText, splitWhatsAppReply } from "./agent/whatsapp-format.js";
 import { config } from "./config.js";
 
 const PORT = 8080;
@@ -64,20 +64,6 @@ async function downloadTwilioImage(url: string, mime: string): Promise<string> {
 // ── Express app ────────────────────────────────────────────────────────────────
 const app = express();
 const seenInboundSids = new Map<string, number>();
-
-function splitWhatsAppReply(message: string, maxLength = 1400): string[] {
-  const chunks: string[] = [];
-  let remaining = message;
-  while (remaining.length > maxLength) {
-    let cut = remaining.lastIndexOf("\n", maxLength);
-    if (cut < maxLength / 2) cut = remaining.lastIndexOf(" ", maxLength);
-    if (cut < maxLength / 2) cut = maxLength;
-    chunks.push(remaining.slice(0, cut).trim());
-    remaining = remaining.slice(cut).trim();
-  }
-  if (remaining) chunks.push(remaining);
-  return chunks;
-}
 
 // Twilio sends URL-encoded form bodies
 app.use(express.urlencoded({ extended: false }));

@@ -16,4 +16,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+        env:
+          TWILIO_ACCOUNT_SID: AC00000000000000000000000000000000
+          TWILIO_AUTH_TOKEN: ci-test-only
+          OPENROUTER_API_KEY: ci-test-only
       - run: npm run build

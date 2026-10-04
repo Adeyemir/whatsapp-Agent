@@ -2,9 +2,13 @@ import { config } from "../config.js";
 import fs from "fs";
 import path from "path";
 
+export type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; image: string }; // URL string
+
 export interface Message {
   role: "user" | "assistant";
-  content: string;
+  content: string | ContentPart[];
 }
 
 // Conversation history persisted to disk so context survives restarts.
@@ -31,6 +35,25 @@ function load(): void {
   }
 }
 
+// Sanitize messages before writing to disk.
+// base64 data URLs can be 100KB+ each — strip them to a compact placeholder
+// so conversations.json stays small. The in-memory store keeps the full data
+// for the current session; after a restart the image is gone but context survives.
+function sanitizeForDisk(messages: Message[]): Message[] {
+  return messages.map((m) => {
+    if (typeof m.content === "string") return m;
+    return {
+      ...m,
+      content: m.content.map((part): ContentPart => {
+        if (part.type === "image" && part.image.startsWith("data:")) {
+          return { type: "text", text: "[image sent by user — not stored]" };
+        }
+        return part;
+      }),
+    };
+  });
+}
+
 // Persist the whole store. Called after each mutation; volume is low enough
 // that a full rewrite is fine.
 function persist(): void {
@@ -38,7 +61,10 @@ function persist(): void {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
-    const obj = Object.fromEntries(store.entries());
+    const obj: Record<string, Message[]> = {};
+    for (const [key, msgs] of store.entries()) {
+      obj[key] = sanitizeForDisk(msgs);
+    }
     fs.writeFileSync(STORE_FILE, JSON.stringify(obj, null, 2), "utf8");
   } catch (err) {
     console.error(`⚠️  Could not persist conversation store: ${(err as Error).message}`);

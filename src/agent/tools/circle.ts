@@ -1,8 +1,12 @@
 import { tool } from "ai";
 import { z } from "zod";
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
+import { fileURLToPath } from "url";
 import axios from "axios";
 import { config } from "../../config.js";
+import { usdcTokenAmount } from "./usdc-balance.js";
+
+const localCircleBin = fileURLToPath(new URL("../../../node_modules/.bin/circle", import.meta.url));
 
 /**
  * Run a circle CLI command and return parsed JSON output.
@@ -12,7 +16,7 @@ function circleCmd(
 ): Promise<{ success: boolean; data: unknown; raw: string }> {
   return new Promise((resolve) => {
     exec(
-      `circle ${args} --output json`,
+      `${localCircleBin} ${args} --output json`,
       { timeout: 30_000, env: { ...process.env, FORCE_COLOR: "0" } },
       (error, stdout, stderr) => {
         const raw = stdout?.toString() ?? stderr?.toString() ?? "";
@@ -32,63 +36,64 @@ function circleCmd(
  * Uses `circle wallet list --type agent --chain <chain>`.
  */
 export async function getWalletAddress(chain = "BASE"): Promise<string | null> {
-  const result = await circleCmd(`wallet list --type agent --chain ${chain}`);
-  if (!result.success) return null;
-  const d = result.data as { data?: { wallets?: Array<{ address: string }> } };
-  return d?.data?.wallets?.[0]?.address ?? null;
+  return new Promise((resolve) => {
+    execFile(localCircleBin, ["wallet", "list", "--type", "agent", "--chain", chain, "--output", "json"],
+      { timeout: 30_000, env: { ...process.env, FORCE_COLOR: "0", NODE_NO_WARNINGS: "1" } },
+      (error, stdout) => {
+        if (error) return resolve(null);
+        try {
+          const result = JSON.parse(stdout) as { data?: { wallets?: Array<{ address?: string }> } };
+          const address = result.data?.wallets?.[0]?.address;
+          resolve(typeof address === "string" && /^0x[a-fA-F0-9]{40}$/.test(address) ? address : null);
+        } catch { resolve(null); }
+      });
+  });
 }
 
-// ─── Check Wallet Balance ─────────────────────────────────────────────────────
+// ─── Check Wallet Balance (all chains) ──────────────────────────────────────
 
-// ─── Check Wallet Balance ─────────────────────────────────────────────────────
+const ALL_CLI_CHAINS = ["ARC", "BASE", "MATIC", "ARB", "ETH", "AVAX", "OP"] as const;
 
 export const checkWalletBalance = tool({
   description:
-    "Check the agent's USDC wallet balance via Circle CLI. Returns balance, wallet address, and chain. Use when the user asks about balance or funds.",
+    "Check the agent's on-chain USDC wallet balance across ARC, BASE, MATIC, ARB, ETH, AVAX, and OP in parallel. Use when the user asks about balance or wallet funds. Returns a total only when all chains succeed.",
   inputSchema: z.object({
     chain: z
       .string()
       .optional()
-      .default("BASE")
-      .describe(
-        "Blockchain to check balance on. Valid values: BASE, ETH, MATIC (Polygon), ARB (Arbitrum), AVAX (Avalanche), OP (Optimism), UNI (Unichain). Default: BASE"
-      ),
+      .describe("Optional: specific chain to highlight. If omitted, all chains are shown."),
   }),
-  execute: async ({ chain }) => {
-    const chainName = chain ?? "BASE";
-    const address = await getWalletAddress(chainName);
+  execute: async () => {
+    const address = await getWalletAddress("BASE");
     if (!address) {
-      return {
-        error: `No agent wallet found on ${chainName}. Say 'create my wallet' to set one up.`,
-      };
+      return { error: "No agent wallet found. Say 'create my wallet' to set one up." };
     }
-    const result = await circleCmd(
-      `wallet balance --chain ${chainName} --address ${address}`
+
+    // Query all chains in parallel
+    const results = await Promise.all(
+      ALL_CLI_CHAINS.map(async (c) => {
+        const r = await circleCmd(`wallet balance --chain ${c} --address ${address}`);
+        if (!r.success) return { chain: c, usdc: "0", error: r.raw };
+        const bals =
+          (r.data as { data?: { balances?: Array<{ amount: string; token: { symbol: string } }> } })
+            ?.data?.balances ?? [];
+        return { chain: c, usdc: usdcTokenAmount(bals) ?? "0" };
+      })
     );
-    if (!result.success) {
-      return {
-        error: `Could not query balance on ${chainName} right now.`,
-        raw: result.raw,
-      };
+    const failures = results.filter((r) => "error" in r);
+    if (failures.length) {
+      return { error: "Could not verify every on-chain balance; no total was computed.", failures };
     }
-    const balances =
-      (result.data as { data?: { balances?: Array<{ amount: string; token: { symbol: string } }> } })
-        ?.data?.balances ?? [];
-    if (balances.length === 0) {
-      // Query succeeded but the wallet holds no tokens on this chain.
-      // Be explicit so the model reports "zero" rather than "unavailable / try again".
-      return {
-        chain: chainName,
-        address,
-        empty: true,
-        message: `The wallet holds no tokens on ${chainName} (balance is 0). Funds may be on another chain such as BASE.`,
-        balances: [],
-      };
-    }
+
+    const nonZero = results.filter((r) => Number(r.usdc) > 0);
+    const totalMicro = results.reduce((sum, r) => sum + toMicro(r.usdc), 0);
+
     return {
-      chain: chainName,
       address,
-      balances: balances.map((b) => ({ amount: b.amount, symbol: b.token.symbol })),
+      onchainByChain: results,
+      nonZeroChains: nonZero.length > 0 ? nonZero : "No on-chain USDC found on any chain",
+      totalOnchainUsdc: fromMicro(totalMicro),
+      note: "On-chain balances only. Run checkGatewayBalance to see Gateway (service payment) funds separately.",
     };
   },
 });
@@ -97,7 +102,7 @@ export const checkWalletBalance = tool({
 
 export const checkGatewayBalance = tool({
   description:
-    "Check the agent's Circle GATEWAY balance (the cross-chain USDC nanopayments pool used to pay for x402 marketplace services). This is DIFFERENT from the on-chain wallet balance: use this when the user asks about their Gateway balance, nanopayments balance, or 'how much can I spend on services'. It reports a unified total plus a per-chain breakdown.",
+    "Check the agent's Circle GATEWAY USDC balance. Gateway funds can pay supported x402 services and can be transferred to an on-chain wallet with a Gateway withdrawal or crosschain transfer. They cannot be used as a direct on-chain wallet send or swap balance. Use this for Gateway, service spending, or transfer availability questions. It reports a unified total plus a per-chain breakdown.",
   inputSchema: z.object({}),
   execute: async () => {
     const address = await getWalletAddress("BASE");
@@ -127,7 +132,87 @@ export const checkGatewayBalance = tool({
       total: d?.total ?? "0",
       token: d?.token ?? "USDC",
       byChain: nonZero.length > 0 ? nonZero : "All chains are zero",
-      note: "This is the Gateway nanopayments balance, used to pay for x402 services — separate from the on-chain wallet balance.",
+      note: "Gateway can pay supported x402 services or fund a Gateway transfer to an on-chain wallet. It is separate from directly spendable on-chain wallet USDC.",
+    };
+  },
+});
+
+// ─── Gateway Withdraw (Gateway → on-chain wallet) ─────────────────────────────
+
+export const gatewayWithdraw = tool({
+  description:
+    "Withdraw USDC from the Circle Gateway nanopayments pool back to the on-chain wallet. Use when the user asks to move/withdraw/transfer funds FROM the Gateway TO their wallet on a specific chain. Requires explicit user confirmation before executing — tell them the amount and destination chain, and only proceed when they say yes.",
+  inputSchema: z.object({
+    amount: z.string().describe("Amount of USDC to withdraw, e.g. '1' or '0.5'"),
+    chain: z
+      .string()
+      .default("BASE")
+      .describe("Chain to withdraw to (BASE, MATIC, ARB, AVAX, OP). Default: BASE"),
+    confirmed: z
+      .boolean()
+      .default(false)
+      .describe("Set true only after the user has explicitly confirmed the withdrawal"),
+  }),
+  execute: async ({ amount, chain, confirmed }) => {
+    if (!confirmed) {
+      return {
+        needsConfirmation: true,
+        message: `This will withdraw ${amount} USDC from Gateway to your ${chain} on-chain wallet. Reply yes to confirm.`,
+      };
+    }
+    const address = await getWalletAddress("BASE");
+    if (!address) return { error: "No agent wallet found." };
+
+    const result = await circleCmd(
+      `gateway withdraw --amount ${amount} --address ${address} --chain ${chain}`
+    );
+    if (!result.success) {
+      return { error: `Withdrawal failed: ${result.raw}` };
+    }
+    return {
+      success: true,
+      message: `Withdrew ${amount} USDC from Gateway to your ${chain} wallet.`,
+      data: result.data,
+    };
+  },
+});
+
+// ─── Gateway Deposit (on-chain wallet → Gateway) ──────────────────────────────
+
+export const gatewayDeposit = tool({
+  description:
+    "Deposit USDC from the on-chain wallet into the Circle Gateway nanopayments pool. Use when the user asks to top up, fund, or move funds INTO the Gateway from their on-chain wallet. Requires explicit user confirmation.",
+  inputSchema: z.object({
+    amount: z.string().describe("Amount of USDC to deposit, e.g. '1' or '0.5'"),
+    chain: z
+      .string()
+      .default("BASE")
+      .describe("Chain to deposit from (BASE, MATIC, ARB, AVAX, OP). Default: BASE"),
+    confirmed: z
+      .boolean()
+      .default(false)
+      .describe("Set true only after the user has explicitly confirmed the deposit"),
+  }),
+  execute: async ({ amount, chain, confirmed }) => {
+    if (!confirmed) {
+      return {
+        needsConfirmation: true,
+        message: `This will deposit ${amount} USDC from your ${chain} on-chain wallet into the Gateway. Reply yes to confirm.`,
+      };
+    }
+    const address = await getWalletAddress("BASE");
+    if (!address) return { error: "No agent wallet found." };
+
+    const result = await circleCmd(
+      `gateway deposit --amount ${amount} --address ${address} --chain ${chain}`
+    );
+    if (!result.success) {
+      return { error: `Deposit failed: ${result.raw}` };
+    }
+    return {
+      success: true,
+      message: `Deposited ${amount} USDC from your ${chain} wallet into the Gateway.`,
+      data: result.data,
     };
   },
 });
@@ -139,8 +224,8 @@ export const checkGatewayBalance = tool({
 const USDC_DECIMALS = 6;
 const MICRO = 10 ** USDC_DECIMALS;
 
-// On-chain chains with a default public RPC in the Circle CLI (ETH has none).
-const ONCHAIN_CHAINS = ["BASE", "MATIC", "ARB"] as const;
+// On-chain chains the Circle CLI can query (has public RPC support).
+const ONCHAIN_CHAINS = ALL_CLI_CHAINS;
 
 function toMicro(amount: string | number): number {
   return Math.round(Number(amount) * MICRO);
@@ -153,37 +238,48 @@ function fromMicro(micro: number): string {
 /** On-chain USDC (in micro-USDC) held by `address` on a single chain. */
 async function onchainUsdcMicro(address: string, chain: string): Promise<number> {
   const result = await circleCmd(`wallet balance --chain ${chain} --address ${address}`);
-  if (!result.success) return 0;
+  if (!result.success) throw new Error(`Could not check ${chain} on-chain balance: ${result.raw}`);
   const balances =
     (result.data as { data?: { balances?: Array<{ amount: string; token: { symbol: string } }> } })
       ?.data?.balances ?? [];
-  return balances
-    .filter((b) => b.token.symbol === "USDC")
-    .reduce((sum, b) => sum + toMicro(b.amount), 0);
+  return toMicro(usdcTokenAmount(balances) ?? "0");
 }
 
-/** Gateway (nanopayments) USDC total, in micro-USDC. */
-async function gatewayUsdcMicro(address: string): Promise<number> {
+/** Gateway USDC total and its funding chains, from the same verified response. */
+async function gatewayUsdcSnapshot(address: string): Promise<{ totalMicro: number; byChain: Array<{ chain: string; usdc: string }> }> {
   const result = await circleCmd(`gateway balance --address ${address} --chain BASE --all`);
-  if (!result.success) return 0;
-  const total = (result.data as { data?: { total?: string } })?.data?.total ?? "0";
-  return toMicro(total);
+  if (!result.success) throw new Error(`Could not check Gateway balance: ${result.raw}`);
+  const data = (result.data as { data?: { total?: string; balances?: Array<{ domain: number; balance: string }> } })?.data;
+  if (!data || typeof data.total !== "string" || !/^\d+(?:\.\d{1,6})?$/.test(data.total) || !Array.isArray(data.balances)) {
+    throw new Error("Circle returned an incomplete Gateway balance.");
+  }
+  const byChain = data.balances
+    .filter((item) => GATEWAY_DOMAIN_TO_CLI[item.domain] && /^\d+(?:\.\d{1,6})?$/.test(item.balance) && Number(item.balance) > 0)
+    .map((item) => ({ chain: GATEWAY_DOMAIN_TO_CLI[item.domain], usdc: item.balance }));
+  return { totalMicro: toMicro(data.total), byChain };
 }
 
 // ─── Chain mapping (x402 network id <-> Circle CLI --chain value) ─────────────
 // Only mainnet chains the CLI can actually pay on.
 const NETWORK_TO_CLI_CHAIN: Record<string, string> = {
-  "1": "ETH",
-  "137": "MATIC",
-  "42161": "ARB",
-  "8453": "BASE",
+  "1":     "ETH",
+  "137":   "MATIC",   // Polygon
+  "42161": "ARB",     // Arbitrum
+  "8453":  "BASE",    // Base
+  "43114": "AVAX",    // Avalanche
+  "10":    "OP",      // Optimism
+  "130":   "UNI",     // Unichain
 };
 // Gateway "domain" number -> CLI chain, for reading the per-chain Gateway split.
 const GATEWAY_DOMAIN_TO_CLI: Record<number, string> = {
   0: "ETH",
+  1: "AVAX",
+  2: "OP",
   3: "ARB",
   6: "BASE",
   7: "MATIC",
+  10: "UNI",
+  26: "ARC",
 };
 
 /** Gateway balance per CLI chain, in micro-USDC (e.g. { MATIC: 2442076 }). */
@@ -274,6 +370,7 @@ export type TotalBalance =
   | {
       totalUsdc: string;
       gatewayUsdc: string;
+      gatewayByChain: Array<{ chain: string; usdc: string }>;
       onchainUsdc: string;
       onchainByChain: Array<{ chain: string; usdc: string }> | "none";
       note: string;
@@ -289,23 +386,47 @@ export async function computeTotalBalance(): Promise<TotalBalance> {
   if (!address) {
     return { error: "No agent wallet found. Say 'create my wallet' to set one up." };
   }
-  const [gatewayMicro, ...chainMicros] = await Promise.all([
-    gatewayUsdcMicro(address),
-    ...ONCHAIN_CHAINS.map((c) => onchainUsdcMicro(address, c)),
-  ]);
+  let gateway: { totalMicro: number; byChain: Array<{ chain: string; usdc: string }> };
+  let chainMicros: number[];
+  try {
+    [gateway, ...chainMicros] = await Promise.all([
+      gatewayUsdcSnapshot(address),
+      ...ONCHAIN_CHAINS.map((c) => onchainUsdcMicro(address, c)),
+    ]);
+  } catch (error) {
+    return { error: (error as Error).message };
+  }
   const onchainByChain = ONCHAIN_CHAINS.map((chain, i) => ({
     chain,
     usdc: fromMicro(chainMicros[i]),
   })).filter((c) => Number(c.usdc) > 0);
   const onchainMicro = chainMicros.reduce((a, b) => a + b, 0);
-  const totalMicro = gatewayMicro + onchainMicro;
+  const totalMicro = gateway.totalMicro + onchainMicro;
   return {
     totalUsdc: fromMicro(totalMicro),
-    gatewayUsdc: fromMicro(gatewayMicro),
+    gatewayUsdc: fromMicro(gateway.totalMicro),
+    gatewayByChain: gateway.byChain,
     onchainUsdc: fromMicro(onchainMicro),
     onchainByChain: onchainByChain.length > 0 ? onchainByChain : "none",
     note: "Total is computed exactly in code (Gateway + on-chain USDC). Report totalUsdc verbatim.",
   };
+}
+
+export function formatTotalBalance(balance: Exclude<TotalBalance, { error: string }>): string {
+  const onchain = Array.isArray(balance.onchainByChain)
+    ? balance.onchainByChain.map((item) => `${item.chain}: ${item.usdc} USDC`).join("\n")
+    : "No on-chain USDC found";
+  const gateway = balance.gatewayByChain.length
+    ? balance.gatewayByChain.map((item) => `${item.chain}: ${item.usdc} USDC`).join("\n")
+    : "No Gateway USDC found";
+  return [
+    "Current verified USDC balances", "",
+    "On-chain wallet", onchain,
+    `On-chain total: ${balance.onchainUsdc} USDC`, "",
+    "Gateway", gateway,
+    `Gateway total: ${balance.gatewayUsdc} USDC`, "",
+    `Combined total: ${balance.totalUsdc} USDC`,
+  ].join("\n");
 }
 
 export const getTotalBalance = tool({
@@ -343,23 +464,39 @@ function runPay(
   maxAmountUsdc: string,
   data?: string
 ): Promise<{ success: boolean; data?: unknown; error?: string; command: string }> {
-  const dataArg = data && method !== "GET" ? ` --data '${data}'` : "";
-  // --timeout gives slow marketplace servers room to respond after payment is
-  // authorized, reducing "paid but no response" timeouts on flaky networks.
-  const cmd = `circle services pay "${serviceUrl}" --address ${address} --chain ${chain} -X ${method}${dataArg} --max-amount ${maxAmountUsdc} --timeout 60 --output json`;
+  const command = "circle services pay";
+  let url: URL;
+  try {
+    url = new URL(serviceUrl);
+  } catch {
+    return Promise.resolve({ success: false, error: "Invalid service URL.", command });
+  }
+  if (url.protocol !== "https:" || url.username || url.password ||
+      !["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].includes(method) ||
+      !/^0x[a-fA-F0-9]{40}$/.test(address) ||
+      !/^(?:ETH|AVAX|OP|ARB|BASE|MATIC|UNI)$/.test(chain) ||
+      !/^\d+(?:\.\d{1,6})?$/.test(maxAmountUsdc)) {
+    return Promise.resolve({ success: false, error: "Invalid service payment parameters.", command });
+  }
+  const args = ["services", "pay", serviceUrl, "--address", address, "--chain", chain, "-X", method];
+  if (data && method !== "GET") args.push("--data", data);
+  // The CLI timeout allows the service to respond after payment settles.
+  args.push("--max-amount", maxAmountUsdc, "--timeout", "60", "--output", "json");
+  const circleBin = fileURLToPath(new URL("../../../node_modules/.bin/circle", import.meta.url));
   return new Promise((resolve) => {
-    exec(
-      cmd,
-      { timeout: 90_000, env: { ...process.env, FORCE_COLOR: "0" } },
+    execFile(
+      circleBin,
+      args,
+      { timeout: 90_000, maxBuffer: 2 * 1024 * 1024, env: { ...process.env, FORCE_COLOR: "0" } },
       (error, stdout, stderr) => {
         const raw = stdout?.toString() ?? stderr?.toString() ?? "";
         if (error) {
-          resolve({ success: false, error: `Payment failed: ${raw}`, command: cmd });
+          resolve({ success: false, error: `Payment failed: ${raw.slice(0, 500)}`, command });
         } else {
           try {
-            resolve({ success: true, data: JSON.parse(raw), command: cmd });
+            resolve({ success: true, data: JSON.parse(raw), command });
           } catch {
-            resolve({ success: true, data: raw, command: cmd });
+            resolve({ success: true, data: raw, command });
           }
         }
       }
@@ -573,13 +710,8 @@ export const webSearch = tool({
       .enum(["general", "news", "finance"])
       .optional()
       .describe("Search category. Use 'news' for current events, 'finance' for markets. Default general."),
-    confirmed: z
-      .boolean()
-      .optional()
-      .default(false)
-      .describe("Only needed if a search costs more than the auto-pay cap. Set true after the user approves the higher cost."),
   }),
-  execute: async ({ query, topic, confirmed }) => {
+  execute: async ({ query, topic }) => {
     // Try free Brave search first; fall back to the paid marketplace on miss.
     const brave = await braveSearch(query);
     if (brave && brave.length > 0) {
@@ -595,11 +727,10 @@ export const webSearch = tool({
 
     // Small searches auto-pay (user opted into pay-per-search). Pricier ones ask.
     const capMicro = Math.round(config.SEARCH_MAX_AUTO_USDC * MICRO);
-    if (plan.priceMicro > capMicro && !confirmed) {
+    if (plan.priceMicro > capMicro) {
       return {
-        needsConfirmation: true,
+        error: `This search costs ${priceUsdc} USDC, above the ${config.SEARCH_MAX_AUTO_USDC} USDC automatic-payment cap. Use the marketplace call flow for an exact WhatsApp approval. No payment was made.`,
         priceUsdc,
-        message: `This search costs ${priceUsdc} USDC, above the ${config.SEARCH_MAX_AUTO_USDC} auto-pay cap. Say yes to run it.`,
       };
     }
 
@@ -810,14 +941,17 @@ export const discoverServices = tool({
       .describe("What kind of service are you looking for? e.g. 'web scraping', 'phone calls', 'image generation'"),
   }),
   execute: async ({ query }) => {
+    if (query && !/^[a-zA-Z0-9 ._-]{1,80}$/.test(query)) {
+      return { error: "Service search supports letters, numbers, spaces, periods, underscores, and hyphens only." };
+    }
     const args = query
       ? `services search "${query}"`
-      : "services list";
+      : "services search";
     const result = await circleCmd(args);
     if (!result.success) {
       return {
         error:
-          "Could not search marketplace. Circle CLI may not be installed. Try: npm install -g @circle-fin/cli@latest",
+          "Could not search the Circle marketplace right now.",
         raw: result.raw,
       };
     }

@@ -8,10 +8,12 @@ const envSchema = z.object({
   TWILIO_ACCOUNT_SID: z.string().min(1, "Missing TWILIO_ACCOUNT_SID"),
   TWILIO_AUTH_TOKEN: z.string().min(1, "Missing TWILIO_AUTH_TOKEN"),
   TWILIO_WHATSAPP_NUMBER: z.string().default("whatsapp:+14155238886"),
+  // Personal agent: only this WhatsApp number may access its wallet tools.
+  OWNER_WHATSAPP_NUMBER: z.string().regex(/^whatsapp:\+[1-9]\d{6,14}$/).optional(),
 
-  // Groq
-  GROQ_API_KEY: z.string().min(1, "Missing GROQ_API_KEY"),
-  GROQ_MODEL: z.string().default("openai/gpt-oss-120b"),
+  // OpenRouter
+  OPENROUTER_API_KEY: z.string().min(1, "Missing OPENROUTER_API_KEY"),
+  OPENROUTER_MODEL: z.string().default("openai/gpt-4o-mini"),
 
   // Web Search (optional Brave key; marketplace search is the default path)
   BRAVE_SEARCH_API_KEY: z.string().optional(),
